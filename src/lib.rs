@@ -12,9 +12,8 @@ struct Dimensions {
 
 pub async fn handle(req: Request<Body>) -> Result<Response<Body>, hyper::Error> {
   match (req.method(), req.uri().path()) {
-    (&Method::GET, "/favicon.ico") => Ok(Response::new(Body::empty())),
     (&Method::GET, "/") => Ok(handle_service(req).await.unwrap()),
-    _ => {
+    (&Method::GET, "/favicon.ico") | _ => {
       let mut not_found = Response::default();
       *not_found.status_mut() = StatusCode::NOT_FOUND;
       Ok(not_found)
@@ -22,33 +21,36 @@ pub async fn handle(req: Request<Body>) -> Result<Response<Body>, hyper::Error> 
   }
 }
 
-async fn handle_service(_req: Request<Body>) -> Result<Response<Body>, hyper::Error> {
-  let image_url = get_image_url(_req).await.unwrap();
+async fn handle_service(_req: Request<Body>) -> Result<Response<Body>, reqwest::Error> {
+  let image_url = match get_image_url(_req).await? {
+    Some(url) => url,
+    None => return Ok(error_response(
+        "No URL parameter set, please use function_path/?url=http://domain/path/to/image.png".to_string(),
+        StatusCode::BAD_REQUEST
+      )
+    )
+  };
 
-  if image_url.is_empty() {
-    let response = error_response(
-      "No URL parameter set, please use function_path/?url=http://domain/path/to/image.png".to_string(),
-      StatusCode::BAD_REQUEST
-    );
-    return Ok(response)
-  }
+  match get_png_size(image_url).await? {
+    Some(dimensions) => {
+      let json = serde_json::to_string(&dimensions).unwrap();
+      return Ok(success_response_json(json))
+    },
+    _ => {
+      let response = error_response(
+        "Currently only PNG format is supported".to_string(),
+        StatusCode::UNSUPPORTED_MEDIA_TYPE
+      );
+      return Ok(response)
+    }
+  };
+}
 
-  let dimensions = get_png_size(image_url).await.unwrap();
-
-  if dimensions.width == 0 && dimensions.height == 0 {
-    let response = error_response(
-      "Currently only PNG format is supported".to_string(),
-      StatusCode::UNSUPPORTED_MEDIA_TYPE
-    );
-    return Ok(response)
-  }
-
-  let json = serde_json::to_string(&dimensions);
-
-  Ok(Response::builder()
+fn success_response_json(json: String) -> Response<Body> {
+  Response::builder()
     .header("Content-Type", "application/json")
-    .body(Body::from(json.unwrap()))
-    .unwrap())
+    .body(Body::from(json))
+    .unwrap()
 }
 
 fn error_response(message: String, status: StatusCode) -> Response<Body> {
@@ -63,7 +65,7 @@ fn error_response(message: String, status: StatusCode) -> Response<Body> {
     .unwrap()
 }
 
-async fn get_image_url(_req: Request<Body>) -> Result<String, hyper::Error> {
+async fn get_image_url(_req: Request<Body>) -> Result<Option<String>, reqwest::Error> {
   let query_pairs = _req
     .uri()
     .query()
@@ -75,24 +77,28 @@ async fn get_image_url(_req: Request<Body>) -> Result<String, hyper::Error> {
     .unwrap_or_else(HashMap::new);
 
   Ok(match query_pairs.get("url") {
-    Some(url) => url.to_string(),
-    None => String::new()
+    Some(url) if url.is_empty() => None,
+    Some(url) => Some(url.to_string()),
+    _ => None
   })
 }
 
-async fn get_png_size(url: String) -> Result<Dimensions, reqwest::Error> {
+async fn get_png_size(url: String) -> Result<Option<Dimensions>, reqwest::Error> {
   let mut response = reqwest::get(&url).await?;
-  let bytes = response.chunk().await?.unwrap();
+  let bytes = match response.chunk().await? {
+    Some(bytes) => bytes,
+    None => return Ok(None)
+  };
   let is_png = bytes.starts_with(b"\x89PNG\r\n\x1a\n");
 
   if !is_png {
-    return Ok(Dimensions { width: 0, height: 0 })
+    return Ok(None)
   }
 
   let width = bytes.slice(16..20);
   let height = bytes.slice(20..24);
   let dimensions = Dimensions { width: to_big_int(width), height: to_big_int(height) };
-  Ok(dimensions)
+  Ok(Some(dimensions))
 }
 
 fn to_big_int(bytes: bytes::Bytes) -> u32 {
